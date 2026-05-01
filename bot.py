@@ -124,10 +124,11 @@ async def handle_channel_audio(message: types.Message) -> None:
         logger.info("Title: '%s' → File: '%s'", clean_title, modified_path.name)
 
         # ── 3. Build display values ──────────────────────────────────────
-        display_title = f"@BASS_MIDAS - {clean_title}"
-
-        # Clean performer — allow_empty=True so "t.me/Phonk_Uz" → ""
-        clean_performer = strip_watermarks(tg_performer, allow_empty=True) if tg_performer else ""
+        # Telegram displays audio as: "performer – title"
+        # We want: "@BASS_MIDAS – {clean song title}"
+        # So: performer = @BASS_MIDAS, title = clean song name
+        display_performer = "@BASS_MIDAS"
+        display_title = clean_title
 
         # ── 4. Prepare thumbnail ─────────────────────────────────────────
         thumb_data = _make_thumbnail(config.COVER_FILE)
@@ -144,15 +145,15 @@ async def handle_channel_audio(message: types.Message) -> None:
             audio=audio_file,
             thumbnail=thumb_input,
             title=display_title,
-            performer=clean_performer if clean_performer else None,
+            performer=display_performer,
             duration=duration,
             caption=caption,
         )
 
         # Track this message so we don't re-process it
         _bot_message_ids.add(sent_msg.message_id)
-        logger.info("Re-uploaded (msg_id=%d) title='%s' performer='%s'",
-                     sent_msg.message_id, display_title, clean_performer)
+        logger.info("Re-uploaded (msg_id=%d) → '%s – %s'",
+                     sent_msg.message_id, display_performer, display_title)
 
         # ── 6. Delete original ───────────────────────────────────────────
         try:
