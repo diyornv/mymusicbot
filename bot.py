@@ -5,10 +5,10 @@ Listens for audio posts in the configured channel, rewrites metadata,
 re-uploads with branding, and deletes the original.
 """
 
-import asyncio
 import io
 import logging
 import shutil
+import time as _time
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, types
@@ -18,7 +18,7 @@ from aiogram.types import BufferedInputFile, FSInputFile
 from PIL import Image
 
 import config
-from metadata import process_audio, strip_watermarks
+from metadata import process_audio
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -37,7 +37,9 @@ bot = Bot(
 )
 dp = Dispatcher()
 
+# ── Startup timestamp — ignore all messages sent before bot starts ───────────
 
+_boot_timestamp: int = 0
 
 # ── Thumbnail cache ─────────────────────────────────────────────────────────
 
@@ -69,6 +71,27 @@ def _make_thumbnail(cover_path: Path) -> bytes:
     return _thumb_bytes
 
 
+def _is_already_branded(audio: types.Audio) -> bool:
+    """
+    Check if this audio was already processed by us.
+    We check multiple signals to be absolutely sure:
+    - performer == "@BASS_MIDAS"
+    - filename contains "@BASS_MIDAS"
+    - title contains "@BASS_MIDAS"
+    """
+    performer = (audio.performer or "").strip()
+    filename = (audio.file_name or "").strip()
+    title = (audio.title or "").strip()
+
+    if performer == "@BASS_MIDAS":
+        return True
+    if "@BASS_MIDAS" in filename:
+        return True
+    if "@BASS_MIDAS" in title:
+        return True
+    return False
+
+
 # ── Handler: channel audio messages ─────────────────────────────────────────
 
 @dp.channel_post(F.audio)
@@ -85,11 +108,15 @@ async def handle_channel_audio(message: types.Message) -> None:
     if audio is None:
         return
 
-    # *** CRITICAL: Skip messages already processed by us ***
-    # We always set performer="@BASS_MIDAS" when uploading.
-    # If this audio already has that performer, it's our own upload — SKIP!
-    if audio.performer and audio.performer.strip() == "@BASS_MIDAS":
-        logger.debug("Skipping already-branded audio (performer=@BASS_MIDAS)")
+    # *** GUARD 1: Skip old messages from before bot started ***
+    msg_date = int(message.date.timestamp()) if message.date else 0
+    if msg_date < _boot_timestamp:
+        logger.debug("Skipping old message (date=%d < boot=%d)", msg_date, _boot_timestamp)
+        return
+
+    # *** GUARD 2: Skip messages already branded by us ***
+    if _is_already_branded(audio):
+        logger.debug("Skipping already-branded audio: '%s'", audio.file_name or audio.title)
         return
 
     file_id = audio.file_id
@@ -125,7 +152,6 @@ async def handle_channel_audio(message: types.Message) -> None:
         # ── 3. Build display values ──────────────────────────────────────
         # Telegram displays audio as: "performer – title"
         # We want: "@BASS_MIDAS – {clean song title}"
-        # So: performer = @BASS_MIDAS, title = clean song name
         display_performer = "@BASS_MIDAS"
         display_title = clean_title
 
@@ -173,18 +199,26 @@ async def handle_channel_audio(message: types.Message) -> None:
 # ── Entry point ─────────────────────────────────────────────────────────────
 
 async def main() -> None:
+    global _boot_timestamp
+
     config.validate()
 
-    # Pre-generate thumbnail at startup to catch errors early
+    # Record boot time — we will ignore ALL messages dated before this
+    _boot_timestamp = int(_time.time())
+
+    # Pre-generate thumbnail at startup
     _make_thumbnail(config.COVER_FILE)
 
     logger.info("@BASS_MIDAS bot starting...")
-    logger.info("  Channel: %s", config.CHANNEL_ID)
-    logger.info("  Cover:   %s", config.COVER_FILE)
+    logger.info("  Channel:   %s", config.CHANNEL_ID)
+    logger.info("  Cover:     %s", config.COVER_FILE)
+    logger.info("  Boot time: %d (ignoring older messages)", _boot_timestamp)
 
+    # Clear ALL pending updates before starting to poll
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, allowed_updates=["channel_post"])
 
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
