@@ -143,9 +143,10 @@ async def handle_channel_audio(message: types.Message) -> None:
         await bot.download_file(file.file_path, destination=download_path)
         logger.info("Downloaded: %s (%d bytes)", download_path.name, download_path.stat().st_size)
 
-        # ── 2. Process metadata ──────────────────────────────────────────
+        # ── 2. Process metadata + voice overlay ─────────────────────────
         clean_title, modified_path = await process_audio(
-            download_path, config.COVER_FILE, tg_title
+            download_path, config.COVER_FILE, tg_title,
+            voice_path=config.VOICE_INTRO_FILE,
         )
         logger.info("Title: '%s' → File: '%s'", clean_title, modified_path.name)
 

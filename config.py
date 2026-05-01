@@ -15,13 +15,15 @@ load_dotenv()
 
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 CHANNEL_ID: int = int(os.getenv("CHANNEL_ID", "0"))
-COVER_IMAGE_PATH: str = os.getenv("COVER_IMAGE_PATH", "assets/channel_cover.jpg")
+COVER_IMAGE_PATH: str = os.getenv("COVER_IMAGE_PATH", "assets/channel_cover.png")
+VOICE_INTRO_PATH: str = os.getenv("VOICE_INTRO_PATH", "assets/voice_intro.mp3")
 
 # ── Derived paths ────────────────────────────────────────────────────────────
 
 BASE_DIR = Path(__file__).resolve().parent
 TMP_DIR = BASE_DIR / "tmp"
 COVER_FILE = BASE_DIR / COVER_IMAGE_PATH
+VOICE_INTRO_FILE = BASE_DIR / VOICE_INTRO_PATH
 
 # ── Validation ───────────────────────────────────────────────────────────────
 
@@ -39,6 +41,13 @@ def validate() -> None:
         errors.append(
             f"Cover image not found at '{COVER_FILE}'.  "
             f"Place your image at '{COVER_IMAGE_PATH}' or update COVER_IMAGE_PATH in .env"
+        )
+
+    if not VOICE_INTRO_FILE.is_file():
+        print(
+            f"[CONFIG WARNING] Voice intro not found at '{VOICE_INTRO_FILE}'. "
+            f"Voice overlay will be SKIPPED. Place your audio at '{VOICE_INTRO_PATH}'.",
+            file=sys.stderr,
         )
 
     if errors:

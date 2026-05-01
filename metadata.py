@@ -1,8 +1,9 @@
 """
-Audio metadata manipulation module.
-Handles ID3 tag editing and cover art embedding via Mutagen.
-Strips all foreign watermarks (t.me/xxx, @xxx) from titles/performers
-and replaces them with @BASS_MIDAS branding.
+Audio metadata & voice-overlay module.
+1. Overlays a voice intro on top of the first N seconds of the track.
+2. Strips foreign watermarks from the title.
+3. Updates ID3 tags (title + cover art).
+4. Renames the file with @BASS_MIDAS branding.
 """
 
 import asyncio
@@ -10,6 +11,7 @@ import logging
 import re
 from pathlib import Path
 
+from pydub import AudioSegment
 from mutagen.id3 import ID3, APIC, TIT2, ID3NoHeaderError
 from mutagen.mp3 import MP3, HeaderNotFoundError
 
@@ -34,7 +36,6 @@ def _detect_mime(cover_path: Path) -> str:
 
 
 def _sanitize_filename(name: str) -> str:
-    """Remove characters illegal in filenames."""
     for ch in r'<>:"/\|?*':
         name = name.replace(ch, "")
     return " ".join(name.split()).strip()
@@ -43,37 +44,13 @@ def _sanitize_filename(name: str) -> str:
 def strip_watermarks(text: str, allow_empty: bool = False) -> str:
     """
     Remove ALL foreign channel watermarks from a string.
-    Handles:
-      - "t.me/Phonk_Uz – SONG NAME"  → "SONG NAME"
-      - "@SomeChannel – SONG NAME"    → "SONG NAME"
-      - "t.me/Phonk_Uz"              → "" (if allow_empty=True)
-      - "SONG NAME | t.me/channel"   → "SONG NAME"
-      - "SONG NAME (@channel)"       → "SONG NAME"
-    Preserves @BASS_MIDAS if already present.
-
-    Args:
-        text: The string to clean.
-        allow_empty: If True, return "" when the entire string is a watermark.
-                     If False, return the original text as fallback.
     """
     cleaned = text.strip()
-
-    # Remove t.me/xxx links anywhere
     cleaned = re.sub(r't\.me/\S+', '', cleaned, flags=re.IGNORECASE)
-
-    # Remove @username tags (but NOT @BASS_MIDAS)
     cleaned = re.sub(r'@(?!BASS_MIDAS)\S+', '', cleaned, flags=re.IGNORECASE)
-
-    # Remove leftover separators at the beginning
     cleaned = re.sub(r'^[\s\-–—|:]+', '', cleaned)
-
-    # Remove leftover separators at the end
     cleaned = re.sub(r'[\s\-–—|:]+$', '', cleaned)
-
-    # Remove empty parentheses
     cleaned = re.sub(r'\(\s*\)', '', cleaned)
-
-    # Collapse spaces
     cleaned = " ".join(cleaned.split()).strip()
 
     if cleaned:
@@ -84,12 +61,70 @@ def strip_watermarks(text: str, allow_empty: bool = False) -> str:
         return text.strip()
 
 
-def _process_tags(audio_path: Path, cover_path: Path, tg_title: str) -> tuple[str, Path]:
+# ── Voice overlay ────────────────────────────────────────────────────────────
+
+def _overlay_voice_intro(audio_path: Path, voice_path: Path) -> Path:
     """
-    1. Extract original title (from ID3 or Telegram metadata).
-    2. Strip all foreign watermarks.
-    3. Update ID3 tags if file is valid MP3.
-    4. Rename file.
+    Overlay a voice intro on top of the beginning of the audio track.
+    The voice is mixed over the music (both are heard simultaneously).
+    The result is exported as a proper MP3 file.
+
+    Returns the path to the new MP3 file.
+    """
+    logger.info("Loading audio for voice overlay...")
+
+    # Load the main audio (pydub + ffmpeg handle any format)
+    music = AudioSegment.from_file(str(audio_path))
+
+    # Load the voice intro
+    voice = AudioSegment.from_file(str(voice_path))
+
+    # Lower the music volume during the voice intro, then restore
+    voice_duration = len(voice)  # in milliseconds
+
+    # Split music into intro part and rest
+    music_intro = music[:voice_duration]
+    music_rest = music[voice_duration:]
+
+    # Lower the music during voice by 8 dB so voice is clearly audible
+    music_intro_quiet = music_intro - 8
+
+    # Overlay voice on top of the quieted music intro
+    mixed_intro = music_intro_quiet.overlay(voice)
+
+    # Combine: mixed intro + rest of the song
+    final = mixed_intro + music_rest
+
+    # Export as proper MP3
+    output_path = audio_path.with_suffix(".out.mp3")
+    final.export(str(output_path), format="mp3", bitrate="192k")
+
+    # Replace original with the mixed version
+    audio_path.unlink(missing_ok=True)
+    output_path.rename(audio_path.with_suffix(".mp3"))
+    final_path = audio_path.with_suffix(".mp3")
+
+    logger.info(
+        "Voice overlay done: voice=%dms, total=%dms, output=%s",
+        voice_duration, len(final), final_path.name,
+    )
+    return final_path
+
+
+# ── Main processing ─────────────────────────────────────────────────────────
+
+def _process_tags(
+    audio_path: Path,
+    cover_path: Path,
+    tg_title: str,
+    voice_path: Path | None,
+) -> tuple[str, Path]:
+    """
+    Full processing pipeline:
+      1. Determine and clean the title.
+      2. Overlay voice intro (if voice file exists).
+      3. Update ID3 tags (title + cover).
+      4. Rename the file.
     Returns (clean_title, new_file_path).
     """
     # ── Get raw title ────────────────────────────────────────────────────
@@ -105,21 +140,30 @@ def _process_tags(audio_path: Path, cover_path: Path, tg_title: str) -> tuple[st
     raw_title = id3_title or tg_title or audio_path.stem
     logger.info("Raw title: '%s'", raw_title)
 
-    # ── Strip all watermarks ─────────────────────────────────────────────
+    # ── Strip watermarks ─────────────────────────────────────────────────
     clean_title = strip_watermarks(raw_title)
-
-    # Also remove our own tag if already there (we'll re-add it)
-    clean_title = re.sub(r'@BASS_MIDAS\s*[-–—]?\s*', '', clean_title, flags=re.IGNORECASE).strip()
+    clean_title = re.sub(
+        r'@BASS_MIDAS\s*[-–—]?\s*', '', clean_title, flags=re.IGNORECASE
+    ).strip()
 
     if not clean_title or len(clean_title) < 2:
         clean_title = audio_path.stem
 
     logger.info("Clean title: '%s'", clean_title)
 
+    # ── Overlay voice intro ──────────────────────────────────────────────
+    if voice_path and voice_path.is_file():
+        try:
+            audio_path = _overlay_voice_intro(audio_path, voice_path)
+        except Exception as e:
+            logger.warning("Voice overlay failed: %s — continuing without it.", e)
+    else:
+        logger.info("No voice intro file — skipping overlay.")
+
     # ── Build new title ──────────────────────────────────────────────────
     new_title = f"{CHANNEL_TAG} - {clean_title}"
 
-    # ── Modify ID3 tags (only if valid MP3) ──────────────────────────────
+    # ── Modify ID3 tags ──────────────────────────────────────────────────
     try:
         mp3 = MP3(str(audio_path))
         logger.info("Valid MP3: %.1fs, %d bps", mp3.info.length, mp3.info.bitrate)
@@ -162,6 +206,11 @@ def _process_tags(audio_path: Path, cover_path: Path, tg_title: str) -> tuple[st
 
 
 async def process_audio(
-    audio_path: Path, cover_path: Path, tg_title: str = ""
+    audio_path: Path,
+    cover_path: Path,
+    tg_title: str = "",
+    voice_path: Path | None = None,
 ) -> tuple[str, Path]:
-    return await asyncio.to_thread(_process_tags, audio_path, cover_path, tg_title)
+    return await asyncio.to_thread(
+        _process_tags, audio_path, cover_path, tg_title, voice_path
+    )
