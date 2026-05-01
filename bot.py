@@ -1,15 +1,12 @@
 """
 Main bot module – @BASS_MIDAS Channel Audio Processor
 =====================================================
-Listens to a configured Telegram channel for audio messages,
-rewrites their ID3 metadata + cover art, re-uploads the modified
-file, and deletes the original post.
-
-Usage:
-    python bot.py
+Listens for audio posts in the configured channel, rewrites metadata,
+re-uploads with branding, and deletes the original.
 """
 
 import asyncio
+import io
 import logging
 import shutil
 from pathlib import Path
@@ -17,10 +14,11 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import FSInputFile
+from aiogram.types import BufferedInputFile, FSInputFile
+from PIL import Image
 
 import config
-from metadata import process_audio
+from metadata import process_audio, strip_watermarks
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -39,22 +37,46 @@ bot = Bot(
 )
 dp = Dispatcher()
 
+# ── Thumbnail cache ─────────────────────────────────────────────────────────
+
+_thumb_bytes: bytes | None = None
+
+
+def _make_thumbnail(cover_path: Path) -> bytes:
+    """
+    Convert cover image to JPEG thumbnail suitable for Telegram.
+    Requirements: JPEG format, <200 KB, max 320x320 pixels.
+    """
+    global _thumb_bytes
+    if _thumb_bytes is not None:
+        return _thumb_bytes
+
+    img = Image.open(cover_path)
+    img = img.convert("RGB")  # Ensure no alpha channel (PNG → JPEG)
+    img.thumbnail((320, 320), Image.LANCZOS)
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85, optimize=True)
+
+    # If still too large, reduce quality
+    if buf.tell() > 200_000:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=60, optimize=True)
+
+    _thumb_bytes = buf.getvalue()
+    logger.info("Thumbnail prepared: %d bytes, %dx%d", len(_thumb_bytes), img.width, img.height)
+    return _thumb_bytes
+
 
 # ── Handler: channel audio messages ─────────────────────────────────────────
 
 @dp.channel_post(F.audio)
 async def handle_channel_audio(message: types.Message) -> None:
     """
-    Triggered every time an audio file is posted in the target channel.
+    Triggered on every audio post in the target channel.
     Pipeline: download → edit tags → re-upload → delete original → cleanup.
     """
-    # Only process messages from the configured channel
     if message.chat.id != config.CHANNEL_ID:
-        logger.debug(
-            "Ignoring audio from chat %s (not target channel %s)",
-            message.chat.id,
-            config.CHANNEL_ID,
-        )
         return
 
     audio = message.audio
@@ -63,82 +85,89 @@ async def handle_channel_audio(message: types.Message) -> None:
 
     file_id = audio.file_id
     original_filename = audio.file_name or f"{file_id}.mp3"
+    tg_title = audio.title or ""
+
     logger.info(
-        "📥 New audio detected: '%s' (file_id=%s, size=%s bytes)",
-        original_filename,
-        file_id,
-        audio.file_size,
+        ">>> New audio: file='%s' | title='%s' | performer='%s' | size=%s",
+        original_filename, tg_title, audio.performer or "", audio.file_size,
     )
 
-    # Create a per-message temp directory to avoid filename collisions
+    # Per-message temp directory
     work_dir = config.TMP_DIR / file_id
     work_dir.mkdir(parents=True, exist_ok=True)
+
+    if not original_filename.lower().endswith(".mp3"):
+        original_filename += ".mp3"
     download_path = work_dir / original_filename
 
     try:
         # ── 1. Download ──────────────────────────────────────────────────
         file = await bot.get_file(file_id)
         await bot.download_file(file.file_path, destination=download_path)
-        logger.info("✅ Downloaded to %s", download_path)
+        logger.info("Downloaded: %s (%d bytes)", download_path.name, download_path.stat().st_size)
 
-        # ── 2. Process metadata (runs in thread) ────────────────────────
-        original_title, modified_path = await process_audio(
-            download_path, config.COVER_FILE
+        # ── 2. Process metadata ──────────────────────────────────────────
+        clean_title, modified_path = await process_audio(
+            download_path, config.COVER_FILE, tg_title
         )
-        logger.info("✅ Metadata processed. New file: %s", modified_path.name)
+        logger.info("Processed → title='%s', file='%s'", clean_title, modified_path.name)
 
-        # ── 3. Re-upload ────────────────────────────────────────────────
-        input_file = FSInputFile(path=str(modified_path), filename=modified_path.name)
+        # ── 3. Build display title ───────────────────────────────────────
+        display_title = f"@BASS_MIDAS - {clean_title}"
 
-        # Read the cover to attach as thumbnail
-        thumb_file = FSInputFile(path=str(config.COVER_FILE))
+        # ── 4. Prepare thumbnail (JPEG, <200KB, 320px) ──────────────────
+        thumb_data = _make_thumbnail(config.COVER_FILE)
+        thumb_input = BufferedInputFile(thumb_data, filename="thumb.jpg")
 
-        # Preserve original caption / performer if present
+        # ── 5. Re-upload ─────────────────────────────────────────────────
+        audio_file = FSInputFile(path=str(modified_path), filename=modified_path.name)
+
         performer = audio.performer or ""
+        if performer:
+            performer = strip_watermarks(performer)
         duration = audio.duration or 0
         caption = message.caption or ""
 
         await bot.send_audio(
             chat_id=config.CHANNEL_ID,
-            audio=input_file,
-            thumbnail=thumb_file,
-            title=f"@BASS_MIDAS - {original_title}",
+            audio=audio_file,
+            thumbnail=thumb_input,
+            title=display_title,
             performer=performer,
             duration=duration,
             caption=caption,
         )
-        logger.info("✅ Modified audio re-uploaded to channel.")
+        logger.info("Re-uploaded with title: '%s'", display_title)
 
-        # ── 4. Delete original message ───────────────────────────────────
-        await message.delete()
-        logger.info("🗑️  Original message deleted.")
+        # ── 6. Delete original ───────────────────────────────────────────
+        try:
+            await message.delete()
+            logger.info("Original message deleted.")
+        except Exception as e:
+            logger.warning("Could not delete original: %s", e)
 
     except Exception:
         logger.exception(
-            "❌ Failed to process audio '%s' (file_id=%s). "
-            "The original message was left untouched.",
+            "FAILED to process '%s'. Original message left untouched.",
             original_filename,
-            file_id,
         )
     finally:
-        # ── 5. Cleanup temp files ────────────────────────────────────────
+        # ── 7. Cleanup ───────────────────────────────────────────────────
         try:
             shutil.rmtree(work_dir)
-            logger.info("🧹 Temp directory cleaned: %s", work_dir)
-        except OSError as exc:
-            logger.warning("Could not remove temp dir %s: %s", work_dir, exc)
+            logger.info("Temp cleaned.")
+        except OSError as e:
+            logger.warning("Cleanup error: %s", e)
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    """Validate config, skip pending updates, and start long-polling."""
     config.validate()
-    logger.info("🚀 @BASS_MIDAS bot is starting…")
-    logger.info("   Channel ID : %s", config.CHANNEL_ID)
-    logger.info("   Cover image: %s", config.COVER_FILE)
+    logger.info("@BASS_MIDAS bot starting...")
+    logger.info("  Channel: %s", config.CHANNEL_ID)
+    logger.info("  Cover:   %s", config.COVER_FILE)
 
-    # Drop pending updates so we don't re-process old messages on restart
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
