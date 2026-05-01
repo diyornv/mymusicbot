@@ -1,9 +1,8 @@
 """
-Audio metadata & voice-overlay module.
-1. Overlays a voice intro on top of the first N seconds of the track.
-2. Strips foreign watermarks from the title.
-3. Updates ID3 tags (title + cover art).
-4. Renames the file with @BASS_MIDAS branding.
+Audio metadata module.
+Strips foreign watermarks from titles, updates ID3 tags (title + cover art),
+and renames the file with @BASS_MIDAS branding.
+Audio content is NOT modified — only metadata changes.
 """
 
 import asyncio
@@ -11,7 +10,6 @@ import logging
 import re
 from pathlib import Path
 
-from pydub import AudioSegment
 from mutagen.id3 import ID3, APIC, TIT2, ID3NoHeaderError
 from mutagen.mp3 import MP3, HeaderNotFoundError
 
@@ -61,70 +59,16 @@ def strip_watermarks(text: str, allow_empty: bool = False) -> str:
         return text.strip()
 
 
-# ── Voice overlay ────────────────────────────────────────────────────────────
-
-def _overlay_voice_intro(audio_path: Path, voice_path: Path) -> Path:
-    """
-    Overlay a voice intro on top of the beginning of the audio track.
-    The voice is mixed over the music (both are heard simultaneously).
-    The result is exported as a proper MP3 file.
-
-    Returns the path to the new MP3 file.
-    """
-    logger.info("Loading audio for voice overlay...")
-
-    # Load the main audio (pydub + ffmpeg handle any format)
-    music = AudioSegment.from_file(str(audio_path))
-
-    # Load the voice intro
-    voice = AudioSegment.from_file(str(voice_path))
-
-    # Lower the music volume during the voice intro, then restore
-    voice_duration = len(voice)  # in milliseconds
-
-    # Split music into intro part and rest
-    music_intro = music[:voice_duration]
-    music_rest = music[voice_duration:]
-
-    # Lower the music during voice by 8 dB so voice is clearly audible
-    music_intro_quiet = music_intro - 8
-
-    # Overlay voice on top of the quieted music intro
-    mixed_intro = music_intro_quiet.overlay(voice)
-
-    # Combine: mixed intro + rest of the song
-    final = mixed_intro + music_rest
-
-    # Export as proper MP3
-    output_path = audio_path.with_suffix(".out.mp3")
-    final.export(str(output_path), format="mp3", bitrate="192k")
-
-    # Replace original with the mixed version
-    audio_path.unlink(missing_ok=True)
-    output_path.rename(audio_path.with_suffix(".mp3"))
-    final_path = audio_path.with_suffix(".mp3")
-
-    logger.info(
-        "Voice overlay done: voice=%dms, total=%dms, output=%s",
-        voice_duration, len(final), final_path.name,
-    )
-    return final_path
-
-
-# ── Main processing ─────────────────────────────────────────────────────────
-
 def _process_tags(
     audio_path: Path,
     cover_path: Path,
     tg_title: str,
-    voice_path: Path | None,
 ) -> tuple[str, Path]:
     """
-    Full processing pipeline:
+    Processing pipeline (metadata only, audio untouched):
       1. Determine and clean the title.
-      2. Overlay voice intro (if voice file exists).
-      3. Update ID3 tags (title + cover).
-      4. Rename the file.
+      2. Update ID3 tags (title + cover).
+      3. Rename the file.
     Returns (clean_title, new_file_path).
     """
     # ── Get raw title ────────────────────────────────────────────────────
@@ -151,19 +95,10 @@ def _process_tags(
 
     logger.info("Clean title: '%s'", clean_title)
 
-    # ── Overlay voice intro ──────────────────────────────────────────────
-    if voice_path and voice_path.is_file():
-        try:
-            audio_path = _overlay_voice_intro(audio_path, voice_path)
-        except Exception as e:
-            logger.warning("Voice overlay failed: %s — continuing without it.", e)
-    else:
-        logger.info("No voice intro file — skipping overlay.")
-
     # ── Build new title ──────────────────────────────────────────────────
     new_title = f"{CHANNEL_TAG} - {clean_title}"
 
-    # ── Modify ID3 tags ──────────────────────────────────────────────────
+    # ── Modify ID3 tags (only if valid MP3) ──────────────────────────────
     try:
         mp3 = MP3(str(audio_path))
         logger.info("Valid MP3: %.1fs, %d bps", mp3.info.length, mp3.info.bitrate)
@@ -209,8 +144,7 @@ async def process_audio(
     audio_path: Path,
     cover_path: Path,
     tg_title: str = "",
-    voice_path: Path | None = None,
 ) -> tuple[str, Path]:
     return await asyncio.to_thread(
-        _process_tags, audio_path, cover_path, tg_title, voice_path
+        _process_tags, audio_path, cover_path, tg_title
     )
