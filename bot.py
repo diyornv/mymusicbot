@@ -37,9 +37,7 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# ── Track messages sent by the bot to avoid infinite loop ────────────────────
 
-_bot_message_ids: set[int] = set()
 
 # ── Thumbnail cache ─────────────────────────────────────────────────────────
 
@@ -83,14 +81,15 @@ async def handle_channel_audio(message: types.Message) -> None:
     if message.chat.id != config.CHANNEL_ID:
         return
 
-    # SKIP messages that the bot itself just sent (prevent infinite loop)
-    if message.message_id in _bot_message_ids:
-        logger.info("Skipping own message (id=%d)", message.message_id)
-        _bot_message_ids.discard(message.message_id)
-        return
-
     audio = message.audio
     if audio is None:
+        return
+
+    # *** CRITICAL: Skip messages already processed by us ***
+    # We always set performer="@BASS_MIDAS" when uploading.
+    # If this audio already has that performer, it's our own upload — SKIP!
+    if audio.performer and audio.performer.strip() == "@BASS_MIDAS":
+        logger.debug("Skipping already-branded audio (performer=@BASS_MIDAS)")
         return
 
     file_id = audio.file_id
@@ -150,8 +149,6 @@ async def handle_channel_audio(message: types.Message) -> None:
             caption=caption,
         )
 
-        # Track this message so we don't re-process it
-        _bot_message_ids.add(sent_msg.message_id)
         logger.info("Re-uploaded (msg_id=%d) → '%s – %s'",
                      sent_msg.message_id, display_performer, display_title)
 
