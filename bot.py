@@ -214,8 +214,24 @@ async def main() -> None:
     logger.info("  Cover:     %s", config.COVER_FILE)
     logger.info("  Boot time: %d (ignoring older messages)", _boot_timestamp)
 
-    # Clear ALL pending updates before starting to poll
+    # ── Aggressively drain ALL pending updates before polling ────────────
     await bot.delete_webhook(drop_pending_updates=True)
+
+    # Manually consume every pending update so nothing is left in the queue
+    drained = 0
+    while True:
+        updates = await bot.get_updates(offset=-1, limit=1)
+        if not updates:
+            break
+        last_update_id = updates[-1].update_id
+        # Mark this update as consumed by requesting offset = last_id + 1
+        await bot.get_updates(offset=last_update_id + 1, limit=1)
+        drained += 1
+        if drained > 500:  # safety limit
+            break
+
+    logger.info("  Drained %d pending update(s). Queue is clean.", drained)
+
     await dp.start_polling(bot, allowed_updates=["channel_post"])
 
 
