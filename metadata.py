@@ -1,7 +1,7 @@
 """
 Audio metadata manipulation module.
 Handles ID3 tag editing and cover art embedding via Mutagen.
-Strips all foreign watermarks (t.me/xxx, @xxx) from titles
+Strips all foreign watermarks (t.me/xxx, @xxx) from titles/performers
 and replaces them with @BASS_MIDAS branding.
 """
 
@@ -40,39 +40,48 @@ def _sanitize_filename(name: str) -> str:
     return " ".join(name.split()).strip()
 
 
-def strip_watermarks(title: str) -> str:
+def strip_watermarks(text: str, allow_empty: bool = False) -> str:
     """
-    Remove ALL foreign channel watermarks from a title.
-    Handles patterns like:
-      - "t.me/Phonk_Uz – SONG NAME"
-      - "t.me/Phonk_Uz - SONG NAME"
-      - "@SomeChannel – SONG NAME"
-      - "@SomeChannel - SONG NAME"
-      - "SONG NAME | t.me/channel"
-      - "SONG NAME (@channel)"
+    Remove ALL foreign channel watermarks from a string.
+    Handles:
+      - "t.me/Phonk_Uz – SONG NAME"  → "SONG NAME"
+      - "@SomeChannel – SONG NAME"    → "SONG NAME"
+      - "t.me/Phonk_Uz"              → "" (if allow_empty=True)
+      - "SONG NAME | t.me/channel"   → "SONG NAME"
+      - "SONG NAME (@channel)"       → "SONG NAME"
     Preserves @BASS_MIDAS if already present.
-    """
-    cleaned = title.strip()
 
-    # Remove t.me/xxx links anywhere in the string
+    Args:
+        text: The string to clean.
+        allow_empty: If True, return "" when the entire string is a watermark.
+                     If False, return the original text as fallback.
+    """
+    cleaned = text.strip()
+
+    # Remove t.me/xxx links anywhere
     cleaned = re.sub(r't\.me/\S+', '', cleaned, flags=re.IGNORECASE)
 
     # Remove @username tags (but NOT @BASS_MIDAS)
     cleaned = re.sub(r'@(?!BASS_MIDAS)\S+', '', cleaned, flags=re.IGNORECASE)
 
-    # Remove leftover separators at the beginning: "– ", "- ", "| "
+    # Remove leftover separators at the beginning
     cleaned = re.sub(r'^[\s\-–—|:]+', '', cleaned)
 
-    # Remove leftover separators at the end: " –", " -", " |"
+    # Remove leftover separators at the end
     cleaned = re.sub(r'[\s\-–—|:]+$', '', cleaned)
 
-    # Remove parentheses that are now empty: "(  )"
+    # Remove empty parentheses
     cleaned = re.sub(r'\(\s*\)', '', cleaned)
 
-    # Collapse multiple spaces
+    # Collapse spaces
     cleaned = " ".join(cleaned.split()).strip()
 
-    return cleaned if cleaned else title.strip()
+    if cleaned:
+        return cleaned
+    elif allow_empty:
+        return ""
+    else:
+        return text.strip()
 
 
 def _process_tags(audio_path: Path, cover_path: Path, tg_title: str) -> tuple[str, Path]:
@@ -99,7 +108,7 @@ def _process_tags(audio_path: Path, cover_path: Path, tg_title: str) -> tuple[st
     # ── Strip all watermarks ─────────────────────────────────────────────
     clean_title = strip_watermarks(raw_title)
 
-    # Also remove @BASS_MIDAS if it's already there (we'll re-add it)
+    # Also remove our own tag if already there (we'll re-add it)
     clean_title = re.sub(r'@BASS_MIDAS\s*[-–—]?\s*', '', clean_title, flags=re.IGNORECASE).strip()
 
     if not clean_title or len(clean_title) < 2:
@@ -122,11 +131,9 @@ def _process_tags(audio_path: Path, cover_path: Path, tg_title: str) -> tuple[st
             mp3.save()
             tags = ID3(str(audio_path))
 
-        # Set title
         tags.delall("TIT2")
         tags.add(TIT2(encoding=3, text=[new_title]))
 
-        # Replace cover art
         tags.delall("APIC")
         cover_data = _read_cover_bytes(cover_path)
         cover_mime = _detect_mime(cover_path)
@@ -138,7 +145,7 @@ def _process_tags(audio_path: Path, cover_path: Path, tg_title: str) -> tuple[st
         logger.info("ID3 tags updated.")
 
     except (HeaderNotFoundError, Exception) as e:
-        logger.warning("Cannot modify ID3 (not standard MP3): %s — skipping.", e)
+        logger.warning("Cannot modify ID3: %s — skipping.", e)
 
     # ── Rename file ──────────────────────────────────────────────────────
     safe_title = _sanitize_filename(clean_title) or "Track"

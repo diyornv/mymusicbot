@@ -37,6 +37,10 @@ bot = Bot(
 )
 dp = Dispatcher()
 
+# ── Track messages sent by the bot to avoid infinite loop ────────────────────
+
+_bot_message_ids: set[int] = set()
+
 # ── Thumbnail cache ─────────────────────────────────────────────────────────
 
 _thumb_bytes: bytes | None = None
@@ -44,7 +48,7 @@ _thumb_bytes: bytes | None = None
 
 def _make_thumbnail(cover_path: Path) -> bytes:
     """
-    Convert cover image to JPEG thumbnail suitable for Telegram.
+    Convert cover image to JPEG thumbnail for Telegram.
     Requirements: JPEG format, <200 KB, max 320x320 pixels.
     """
     global _thumb_bytes
@@ -52,19 +56,18 @@ def _make_thumbnail(cover_path: Path) -> bytes:
         return _thumb_bytes
 
     img = Image.open(cover_path)
-    img = img.convert("RGB")  # Ensure no alpha channel (PNG → JPEG)
+    img = img.convert("RGB")
     img.thumbnail((320, 320), Image.LANCZOS)
 
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85, optimize=True)
 
-    # If still too large, reduce quality
     if buf.tell() > 200_000:
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=60, optimize=True)
 
     _thumb_bytes = buf.getvalue()
-    logger.info("Thumbnail prepared: %d bytes, %dx%d", len(_thumb_bytes), img.width, img.height)
+    logger.info("Thumbnail: %d bytes, %dx%d", len(_thumb_bytes), img.width, img.height)
     return _thumb_bytes
 
 
@@ -76,7 +79,14 @@ async def handle_channel_audio(message: types.Message) -> None:
     Triggered on every audio post in the target channel.
     Pipeline: download → edit tags → re-upload → delete original → cleanup.
     """
+    # Only process messages from the configured channel
     if message.chat.id != config.CHANNEL_ID:
+        return
+
+    # SKIP messages that the bot itself just sent (prevent infinite loop)
+    if message.message_id in _bot_message_ids:
+        logger.info("Skipping own message (id=%d)", message.message_id)
+        _bot_message_ids.discard(message.message_id)
         return
 
     audio = message.audio
@@ -86,10 +96,11 @@ async def handle_channel_audio(message: types.Message) -> None:
     file_id = audio.file_id
     original_filename = audio.file_name or f"{file_id}.mp3"
     tg_title = audio.title or ""
+    tg_performer = audio.performer or ""
 
     logger.info(
         ">>> New audio: file='%s' | title='%s' | performer='%s' | size=%s",
-        original_filename, tg_title, audio.performer or "", audio.file_size,
+        original_filename, tg_title, tg_performer, audio.file_size,
     )
 
     # Per-message temp directory
@@ -110,47 +121,48 @@ async def handle_channel_audio(message: types.Message) -> None:
         clean_title, modified_path = await process_audio(
             download_path, config.COVER_FILE, tg_title
         )
-        logger.info("Processed → title='%s', file='%s'", clean_title, modified_path.name)
+        logger.info("Title: '%s' → File: '%s'", clean_title, modified_path.name)
 
-        # ── 3. Build display title ───────────────────────────────────────
+        # ── 3. Build display values ──────────────────────────────────────
         display_title = f"@BASS_MIDAS - {clean_title}"
 
-        # ── 4. Prepare thumbnail (JPEG, <200KB, 320px) ──────────────────
+        # Clean performer — allow_empty=True so "t.me/Phonk_Uz" → ""
+        clean_performer = strip_watermarks(tg_performer, allow_empty=True) if tg_performer else ""
+
+        # ── 4. Prepare thumbnail ─────────────────────────────────────────
         thumb_data = _make_thumbnail(config.COVER_FILE)
         thumb_input = BufferedInputFile(thumb_data, filename="thumb.jpg")
 
         # ── 5. Re-upload ─────────────────────────────────────────────────
         audio_file = FSInputFile(path=str(modified_path), filename=modified_path.name)
 
-        performer = audio.performer or ""
-        if performer:
-            performer = strip_watermarks(performer)
         duration = audio.duration or 0
         caption = message.caption or ""
 
-        await bot.send_audio(
+        sent_msg = await bot.send_audio(
             chat_id=config.CHANNEL_ID,
             audio=audio_file,
             thumbnail=thumb_input,
             title=display_title,
-            performer=performer,
+            performer=clean_performer if clean_performer else None,
             duration=duration,
             caption=caption,
         )
-        logger.info("Re-uploaded with title: '%s'", display_title)
+
+        # Track this message so we don't re-process it
+        _bot_message_ids.add(sent_msg.message_id)
+        logger.info("Re-uploaded (msg_id=%d) title='%s' performer='%s'",
+                     sent_msg.message_id, display_title, clean_performer)
 
         # ── 6. Delete original ───────────────────────────────────────────
         try:
             await message.delete()
-            logger.info("Original message deleted.")
+            logger.info("Original message (id=%d) deleted.", message.message_id)
         except Exception as e:
             logger.warning("Could not delete original: %s", e)
 
     except Exception:
-        logger.exception(
-            "FAILED to process '%s'. Original message left untouched.",
-            original_filename,
-        )
+        logger.exception("FAILED to process '%s'. Original left untouched.", original_filename)
     finally:
         # ── 7. Cleanup ───────────────────────────────────────────────────
         try:
@@ -164,6 +176,10 @@ async def handle_channel_audio(message: types.Message) -> None:
 
 async def main() -> None:
     config.validate()
+
+    # Pre-generate thumbnail at startup to catch errors early
+    _make_thumbnail(config.COVER_FILE)
+
     logger.info("@BASS_MIDAS bot starting...")
     logger.info("  Channel: %s", config.CHANNEL_ID)
     logger.info("  Cover:   %s", config.COVER_FILE)
